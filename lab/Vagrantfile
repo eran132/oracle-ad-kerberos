@@ -1,0 +1,128 @@
+# wks01 — domain-joined Windows 11 workstation for DBeaver/Kerberos testing.
+#
+# Brings up a single VM that:
+#   - lives at 192.168.56.40 on the host-only network
+#   - points DNS at ad1.mylab.local (the lab DC)
+#   - trusts the lab Root CA `mylab-root-ca` plus any corporate proxy CAs
+#   - joins the mylab.local domain
+#   - has DBeaver + Oracle JDBC jars staged, with dbeaver.ini wired for Kerberos
+#   - has the LSA `allowtgtsessionkey` registry tweak applied
+#
+# After provisioning, log into the console as MYLAB\alice (interactive sign-in).
+# Windows obtains a TGT into LSA automatically at logon, DBeaver's JVM reads
+# it via SSPI/JGSS, and no kinit is ever needed.
+#
+# Required environment variables before `vagrant up`:
+#   AD_ADMIN_USER  — e.g. 'mylab\Administrator'
+#   AD_ADMIN_PW    — the Administrator password (lives only in this process env)
+
+Vagrant.configure("2") do |config|
+
+  ad_admin_user = ENV['AD_ADMIN_USER'] || 'mylab\Administrator'
+  ad_admin_pw   = ENV['AD_ADMIN_PW']
+  # Password is only needed for operations that actually run the provisioner.
+  # Don't block `destroy`, `status`, `halt`, `box`, etc.
+  provisioning_ops = %w[up provision reload]
+  if provisioning_ops.include?(ARGV.first) && (ad_admin_pw.nil? || ad_admin_pw.empty?)
+    abort "AD_ADMIN_PW environment variable is required for `vagrant #{ARGV.first} wks01`. Set it first:\n" \
+          "    $env:AD_ADMIN_PW = 'your-Administrator-password'\n" \
+          "It is read directly into the provisioner and never persisted to disk."
+  end
+
+  # Offline (air-gapped) mode: when LAB_OFFLINE=1, upload everything in
+  # lab/bundle/ to C:\Windows\Temp\bundle\ inside the guest and run the
+  # offline variant of the DBeaver provisioner. See docs/14-air-gapped.md.
+  offline_mode = (ENV['LAB_OFFLINE'].to_s == '1')
+  if offline_mode
+    bundle_required = %w[
+      bundle/dbeaver-portable.zip
+      bundle/ojdbc8.jar
+      bundle/oraclepki.jar
+      bundle/osdt_core.jar
+      bundle/osdt_cert.jar
+    ]
+    missing = bundle_required.reject { |p| File.exist?(p) }
+    unless missing.empty?
+      abort "LAB_OFFLINE=1 but the offline bundle is incomplete. Missing:\n  - " +
+            missing.join("\n  - ") + "\nRun lab\\tools\\stage-offline-bundle.ps1 on an internet-connected PC " \
+            "and copy lab\\bundle\\ over."
+    end
+  end
+
+  config.vm.define "wks01" do |wks|
+    wks.vm.box      = "gusztavvargadr/windows-11"
+    wks.vm.hostname = "wks01"   # short name; domain join sets the FQDN
+    wks.vm.network "private_network", ip: "192.168.56.40"
+
+    # WinRM is the default communicator for gusztavvargadr boxes.
+    wks.vm.communicator = "winrm"
+    wks.winrm.username  = "vagrant"
+    wks.winrm.password  = "vagrant"
+
+    # No synced folder — we copy files via the `file` provisioner instead.
+    wks.vm.synced_folder ".", "/vagrant", disabled: true
+
+    wks.vm.provider "virtualbox" do |vb|
+      vb.name   = "oracle-ad-kerberos-wks01"
+      vb.cpus   = 2
+      vb.memory = 3072            # 3 GB — under MS minimum but workable for the lab.
+      vb.gui    = true            # so the user can log in as MYLAB\alice afterward.
+      vb.customize ["modifyvm", :id, "--clipboard-mode", "bidirectional"]
+    end
+
+    # Drop the trust + provisioning material into the guest before any
+    # PowerShell runs. Vagrant's `file` provisioner uses WinRM upload.
+    wks.vm.provision "file", source: "../config/windows/trust/mylab-root-ca.cer",
+                              destination: "C:\\Windows\\Temp\\mylab-root-ca.cer"
+    wks.vm.provision "file", source: "../config/windows/krb5.ini.example",
+                              destination: "C:\\Windows\\Temp\\krb5.ini"
+    wks.vm.provision "file", source: "../config/windows/dbeaver-jvm-args.example",
+                              destination: "C:\\Windows\\Temp\\dbeaver-jvm-args.txt"
+    wks.vm.provision "file", source: "../config/windows/allowtgtsessionkey.reg",
+                              destination: "C:\\Windows\\Temp\\allowtgtsessionkey.reg"
+
+    # Corporate proxy roots. The host is behind a TLS-intercepting proxy
+    # (e.g. Bluecoat / Symantec) and the new VM has no corporate GPO to push
+    # them. Without these, every HTTPS download from github / maven / dbeaver.io
+    # fails "Could not establish trust relationship for the SSL/TLS secure channel."
+    #
+    # Source depends on mode:
+    #   online: sibling repo's ../tableau_ad_oracle/ca/*.crt (if present)
+    #   offline: bundle/corp-proxy-CAs/*.crt (curated by stage-offline-bundle.ps1)
+    corp_ca_sources = if offline_mode
+      Dir.glob("bundle/corp-proxy-CAs/*.crt")
+    else
+      Dir.exist?("../../tableau_ad_oracle/ca") ? Dir.glob("../../tableau_ad_oracle/ca/*.crt") : []
+    end
+    corp_ca_sources.each do |crt|
+      wks.vm.provision "file", source: crt,
+                                destination: "C:\\Windows\\Temp\\corp-#{File.basename(crt)}"
+    end
+
+    # In offline mode, copy the bundle top-level files into the guest. Skip
+    # directories (corp-proxy-CAs/ is handled separately above), README and
+    # gitignore (repo bookkeeping, not bits the provisioner consumes).
+    if offline_mode
+      Dir.glob("bundle/*").each do |f|
+        next if File.directory?(f)
+        next if File.basename(f).start_with?('.')
+        next if %w[README.md README.txt].include?(File.basename(f))
+        wks.vm.provision "file", source: f,
+                                  destination: "C:\\Windows\\Temp\\bundle\\#{File.basename(f)}"
+      end
+    end
+
+    # Phase 1: OS prep + domain join. Reboot at the end.
+    wks.vm.provision "shell", name: "01-os-prep-and-join",
+                              path: "provision/01-os-prep-and-join.ps1",
+                              env: { "AD_ADMIN_USER" => ad_admin_user,
+                                     "AD_ADMIN_PW"   => ad_admin_pw },
+                              reboot: true
+
+    # Phase 2: pick online or offline DBeaver installer.
+    phase2_script = offline_mode ? "provision/02-install-dbeaver-offline.ps1" \
+                                 : "provision/02-install-dbeaver.ps1"
+    wks.vm.provision "shell", name: "02-install-dbeaver",
+                              path: phase2_script
+  end
+end

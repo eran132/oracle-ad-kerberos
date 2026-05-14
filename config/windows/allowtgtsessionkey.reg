@@ -1,0 +1,19 @@
+Windows Registry Editor Version 5.00
+
+; allowtgtsessionkey = 1
+;
+; Lets user-mode applications (including a JVM running as the interactive
+; Windows user) read the TGT session key out of the LSA credential cache.
+; Required ONLY if you choose to use the Windows native LSA cache instead
+; of an MIT-style file ccache.
+;
+; THIS LAB DOES NOT REQUIRE THIS TWEAK. It is provided for the case where
+; the Windows host is domain-joined and you want JDBC to consume the TGT
+; that was obtained at interactive logon (no kinit). See
+; docs/06-windows-lsa-and-ccache.md, section 3.
+;
+; Apply with:   reg import .\config\windows\allowtgtsessionkey.reg
+; Then REBOOT — LSA reads this value only at boot.
+
+[HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Parameters]
+"allowtgtsessionkey"=dword:00000001

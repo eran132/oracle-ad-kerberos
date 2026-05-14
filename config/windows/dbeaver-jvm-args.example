@@ -1,0 +1,15 @@
+# JVM arguments to add to C:\Program Files\DBeaver\dbeaver.ini, AFTER the line `-vmargs`.
+# Edit dbeaver.ini as Administrator. One argument per line. No surrounding quotes.
+# Restart DBeaver after editing.
+
+-Djava.security.krb5.conf=C:\ProgramData\MIT\Kerberos5\krb5.ini
+-Djavax.security.auth.useSubjectCredsOnly=false
+-Dsun.security.krb5.debug=false
+-Dsun.security.jgss.debug=false
+
+# Flip the two debug flags to `true` while troubleshooting, then back to `false`.
+# When debug is on, launch DBeaver from a PowerShell window to see GSS/Kerberos trace:
+#   & "C:\Program Files\DBeaver\dbeaver.exe"
+#
+# Note: KRB5CCNAME is NOT a -D property. Set it as a User-scope environment variable
+# (see docs/06-windows-lsa-and-ccache.md, section 2b).

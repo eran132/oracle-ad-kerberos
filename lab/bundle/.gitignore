@@ -1,0 +1,5 @@
+# The bundle is large (~140 MB) and the binaries are re-fetchable.
+# Keep README.md and .gitignore in version control; ignore everything else.
+*
+!.gitignore
+!README.md
