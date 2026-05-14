@@ -1,3 +1,8 @@
+# Secrets — local-only credentials for installers / sync wrapper.
+# Track .env.example as a documented template; never commit .env itself.
+.env
+.env.local
+
 # Claude Code per-user settings (auto-allow rules, conversation routing)
 .claude/
 
