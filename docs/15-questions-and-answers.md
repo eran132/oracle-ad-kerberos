@@ -96,6 +96,19 @@ Two common reasons:
 1. **Wrong `dbeaver.ini`.** Each install has its own. winget per-user install lives at `C:\Users\<you>\AppData\Local\DBeaver\dbeaver.ini`; the portable install in wks01 is at `C:\Program Files\dbeaver\dbeaver.ini`. Edit the one next to the `dbeaver.exe` you're actually launching.
 2. **DBeaver was still running.** Close *all* DBeaver windows (including the splash screen), then relaunch. JVM args are read once at startup.
 
+### What about the DBeaver wiki page on Kerberos auth?
+
+There's a wiki page at <https://github.com/dbeaver/dbeaver/wiki/Kerberos-Authentication> from April 2023. It's **partially stale and partially Community-incompatible**:
+
+- The Kerberos UI panel ("Use kinit" checkbox etc.) it documents is only present in **DBeaver Lite / Enterprise / Ultimate**. Community edition (what this lab uses) has no such panel. The working recipe in [docs/08](08-dbeaver-connection.md) is the only path for Community.
+- It warns: *"Oracle JDBC driver 21 has broken Kerberos authentication, at least for most of the old configurations. Use an older driver (12.x or 19.x)."* This was true historically but is **not** what we ship. We use `ojdbc8 23.3.0.23.09` and it works — **only because** we do the manual setup the wiki doesn't cover: `dbeaver.ini` JVM args (with the full `--add-opens` set), bare `KERBEROS5` in driver properties (not `(KERBEROS5)`), `oracle.net.kerberos5_mutual_authentication=false`, `auth-model: oracle_native` in `data-sources.json`, and `forwardable = false` in `krb5.ini`.
+
+So: skim the wiki for context, but the authoritative recipe for Community on this lab is [docs/08-dbeaver-connection.md](08-dbeaver-connection.md) + [config/windows/dbeaver-jvm-args.example](../config/windows/dbeaver-jvm-args.example).
+
+### Why does the lab not use Oracle Centrally Managed Users (CMU)?
+
+Because Oracle 19c's CMU + Kerberos code path is broken in a way only Oracle Support can resolve — Oracle's NTZ (TLS) layer closes the TCP socket to AD's LDAPS port 7 ms after establishing it, without ever sending Client Hello. Same failure across every documented configuration. See [docs/16-cmu-19c-failure-mode.md](16-cmu-19c-failure-mode.md) for the full investigation and [docs/17-external-users-and-ad-sync.md](17-external-users-and-ad-sync.md) for what we ship instead. Same end-user behavior, no broken Oracle code path.
+
 ---
 
 ## Operations

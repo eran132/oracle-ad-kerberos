@@ -17,13 +17,15 @@ Path: `$ORACLE_HOME/network/admin/sqlnet.ora` (typically `/u01/app/oracle/produc
 Content ([..\..\..\tableau_ad_oracle\config\oracle-sqlnet.ora.example](../../tableau_ad_oracle/config/oracle-sqlnet.ora.example)):
 
 ```
-SQLNET.AUTHENTICATION_SERVICES = (KERBEROS5)
+SQLNET.AUTHENTICATION_SERVICES = (BEQ, KERBEROS5)
 SQLNET.KERBEROS5_CONF = /etc/krb5.conf
 SQLNET.KERBEROS5_CONF_MIT = TRUE
 SQLNET.KERBEROS5_KEYTAB = /etc/oracle/keytabs/ora01.keytab
-SQLNET.KERBEROS5_CC_NAME = /tmp/krb5cc_%{uid}
 SQLNET.FALLBACK_AUTHENTICATION = FALSE
+SQLNET.AUTHENTICATION_KERBEROS5_SERVICE = oracle
 ```
+
+> **Do not set `SQLNET.KERBEROS5_CC_NAME = /tmp/krb5cc_%{uid}`.** Oracle's sqlnet parser does **not** substitute `%{uid}` — that's a libkrb5/sssd syntax. With this line set, sqlnet looks for a file named *literally* `/tmp/krb5cc_%{uid}` and the Kerberos adapter init fails. Leave it unset; the server doesn't need a client ccache (it has the keytab). See [troubleshooting.md#ora-12641](../troubleshooting.md#ora-12641).
 
 Line by line:
 
