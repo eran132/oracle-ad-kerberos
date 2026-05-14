@@ -1,15 +1,40 @@
-# JVM arguments to add to C:\Program Files\DBeaver\dbeaver.ini, AFTER the line `-vmargs`.
+# JVM arguments to add to C:\Program Files\dbeaver\dbeaver.ini, AFTER the line `-vmargs`.
 # Edit dbeaver.ini as Administrator. One argument per line. No surrounding quotes.
 # Restart DBeaver after editing.
 
+# --- Kerberos pointers -------------------------------------------------------
 -Djava.security.krb5.conf=C:\ProgramData\MIT\Kerberos5\krb5.ini
 -Djavax.security.auth.useSubjectCredsOnly=false
 -Dsun.security.krb5.debug=false
 -Dsun.security.jgss.debug=false
 
-# Flip the two debug flags to `true` while troubleshooting, then back to `false`.
-# When debug is on, launch DBeaver from a PowerShell window to see GSS/Kerberos trace:
-#   & "C:\Program Files\DBeaver\dbeaver.exe"
+# --- JGSS reflection access (REQUIRED on Java 17+ / DBeaver 25.x) -----------
+# Oracle JDBC's Kerberos handler reflects into sun.security.jgss internals.
+# Without these, the connect fails with InaccessibleObjectException or similar.
+# The 5 lines under java.security.jgss/* are the non-obvious ones.
+--add-opens=java.base/java.io=ALL-UNNAMED
+--add-opens=java.base/java.lang=ALL-UNNAMED
+--add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+--add-opens=java.base/java.net=ALL-UNNAMED
+--add-opens=java.base/java.nio=ALL-UNNAMED
+--add-opens=java.base/java.security=ALL-UNNAMED
+--add-opens=java.base/java.util=ALL-UNNAMED
+--add-opens=java.base/sun.security.ssl=ALL-UNNAMED
+--add-opens=java.base/sun.security.util=ALL-UNNAMED
+--add-opens=java.security.jgss/sun.security.jgss=ALL-UNNAMED
+--add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+--add-opens=java.security.jgss/sun.security.krb5.internal=ALL-UNNAMED
+--add-opens=java.security.jgss/sun.security.krb5.internal.crypto=ALL-UNNAMED
+--add-opens=java.security.jgss/sun.security.krb5.internal.ccache=ALL-UNNAMED
+
+# --- Debug flags -------------------------------------------------------------
+# Flip the two `-Dsun.security.*.debug` flags above from `false` to `true` while
+# troubleshooting. When debug is on, launch DBeaver from a PowerShell window so
+# the GSS/Kerberos trace lands on stderr where you can read it:
+#   & "C:\Program Files\dbeaver\dbeaver.exe"
+# Flip them back to `false` once it works; the output is extremely noisy.
 #
-# Note: KRB5CCNAME is NOT a -D property. Set it as a User-scope environment variable
-# (see docs/06-windows-lsa-and-ccache.md, section 2b).
+# Note: KRB5CCNAME is NOT a -D property. If you need a file ccache (non-domain-
+# joined Windows host), set KRB5CCNAME as a User-scope environment variable AND
+# put `oracle.net.kerberos5_cc_name` on the DBeaver connection's driver
+# properties tab. See docs/06-windows-lsa-and-ccache.md and docs/08.

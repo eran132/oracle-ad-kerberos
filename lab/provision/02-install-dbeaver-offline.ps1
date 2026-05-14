@@ -87,7 +87,10 @@ Invoke-Step '02f: Inject Kerberos JVM args into dbeaver.ini' {
     $iniPath = Join-Path $dbeaverDir 'dbeaver.ini'
     $argsFile = 'C:\Windows\Temp\dbeaver-jvm-args.txt'
     if (-not (Test-Path $argsFile)) { throw "Expected $argsFile (uploaded by Vagrantfile)." }
-    $additions = Get-Content $argsFile | Where-Object { $_ -match '^-D' }
+    # Accept both -D... properties and --add-opens=... lines. The full set is
+    # required on Java 17+ (DBeaver 25.x bundles Java 21); without --add-opens
+    # entries the Kerberos handshake fails with InaccessibleObjectException.
+    $additions = Get-Content $argsFile | Where-Object { $_ -match '^(-D|--add-opens=)' }
     $lines = Get-Content $iniPath
     $keep  = $lines | Where-Object { $additions -notcontains $_.Trim() }
     $out   = New-Object System.Collections.Generic.List[string]

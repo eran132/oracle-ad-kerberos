@@ -58,7 +58,10 @@ $base = 'https://repo1.maven.org/maven2/com/oracle/database'
 
 Write-Host "=== 02e: Inject Kerberos JVM args into dbeaver.ini ==="
 $iniPath = Join-Path $dbeaverDir 'dbeaver.ini'
-$additions = Get-Content 'C:\Windows\Temp\dbeaver-jvm-args.txt' | Where-Object { $_ -match '^-D' }
+# Accept both -D... properties and --add-opens=... lines. The full --add-opens
+# set is required on Java 17+ (DBeaver 25.x bundles Java 21); without those
+# entries the Kerberos handshake fails with InaccessibleObjectException.
+$additions = Get-Content 'C:\Windows\Temp\dbeaver-jvm-args.txt' | Where-Object { $_ -match '^(-D|--add-opens=)' }
 $lines = Get-Content $iniPath
 $keep  = $lines | Where-Object { $additions -notcontains $_.Trim() }
 $out   = New-Object System.Collections.Generic.List[string]
