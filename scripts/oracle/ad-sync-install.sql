@@ -121,9 +121,23 @@ COMMIT;
 -- ---------------------------------------------------------------------------
 CREATE TABLE ad_sync.ad_sync_log (
   ts        TIMESTAMP    DEFAULT SYSTIMESTAMP,
-  lvl       VARCHAR2(10),   -- INFO / CREATE / GRANT / REVOKE / ERROR / START / END / PHASE
+  lvl       VARCHAR2(10),   -- INFO / CREATE / GRANT / REVOKE / ERROR / START / END / PHASE / BREAKER
   msg       VARCHAR2(4000)
 );
+
+-- Circuit-breaker state (single row). After N consecutive LDAP failures the
+-- breaker "opens" for a cooldown window: ldap_open() then fails fast WITHOUT
+-- touching the network, so a DC outage cannot add latency to every login
+-- (the AFTER LOGON trigger path in particular). It still fails OPEN for the
+-- user (login succeeds, roles stay as last good) -- see docs/20 section 2.
+CREATE TABLE ad_sync.ad_sync_breaker (
+  id              NUMBER       DEFAULT 1 PRIMARY KEY,
+  consec_failures NUMBER       DEFAULT 0 NOT NULL,
+  open_until      TIMESTAMP
+);
+INSERT INTO ad_sync.ad_sync_breaker(id, consec_failures, open_until)
+VALUES (1, 0, NULL);
+COMMIT;
 
 -- ---------------------------------------------------------------------------
 -- 5) Package: ad_sync.ad_sync
@@ -142,6 +156,10 @@ CREATE OR REPLACE PACKAGE BODY ad_sync.ad_sync AS
   c_bind_dn   CONSTANT VARCHAR2(128) := 'svc-ora-ldap@MYLAB.LOCAL';
   c_bind_pwd  CONSTANT VARCHAR2(64)  := '&bind_pwd';
   c_wallet    CONSTANT VARCHAR2(128) := 'file:/u01/app/oracle/cmu/wallet';
+
+  -- Circuit-breaker tunables (must be declared before any subprogram body).
+  c_breaker_threshold CONSTANT PLS_INTEGER := 3;    -- trip after N consecutive failures
+  c_breaker_cooldown  CONSTANT PLS_INTEGER := 300;  -- seconds the breaker stays open
 
   TYPE t_group_map IS RECORD (group_dn VARCHAR2(256), role_nm VARCHAR2(30));
   TYPE t_group_maps IS TABLE OF t_group_map;
@@ -163,14 +181,55 @@ CREATE OR REPLACE PACKAGE BODY ad_sync.ad_sync AS
     COMMIT;
   END;
 
+  FUNCTION breaker_is_open RETURN BOOLEAN IS
+    v TIMESTAMP;
+  BEGIN
+    SELECT open_until INTO v FROM ad_sync.ad_sync_breaker WHERE id = 1;
+    RETURN v IS NOT NULL AND v > SYSTIMESTAMP;
+  END;
+
+  PROCEDURE breaker_success IS
+    PRAGMA AUTONOMOUS_TRANSACTION;
+  BEGIN
+    UPDATE ad_sync.ad_sync_breaker
+       SET consec_failures = 0, open_until = NULL
+     WHERE id = 1 AND (consec_failures <> 0 OR open_until IS NOT NULL);
+    COMMIT;
+  END;
+
+  PROCEDURE breaker_failure IS
+    PRAGMA AUTONOMOUS_TRANSACTION;
+    n NUMBER;
+  BEGIN
+    UPDATE ad_sync.ad_sync_breaker
+       SET consec_failures = consec_failures + 1,
+           open_until = CASE
+             WHEN consec_failures + 1 >= c_breaker_threshold
+               THEN SYSTIMESTAMP + NUMTODSINTERVAL(c_breaker_cooldown, 'SECOND')
+             ELSE open_until END
+     WHERE id = 1
+    RETURNING consec_failures INTO n;
+    COMMIT;
+    IF n >= c_breaker_threshold THEN
+      log('BREAKER', 'opened after ' || n || ' consecutive failures; cooldown '
+                     || c_breaker_cooldown || 's');
+    END IF;
+  END;
+
   FUNCTION ldap_open RETURN DBMS_LDAP.session IS
     s DBMS_LDAP.session;
     r PLS_INTEGER;
   BEGIN
+    -- Fast-fail without touching the network if the breaker is open.
+    IF breaker_is_open THEN
+      RAISE_APPLICATION_ERROR(-20901,
+        'ad_sync circuit breaker open (recent consecutive LDAP failures) - skipping');
+    END IF;
     DBMS_LDAP.use_exception := TRUE;
     s := DBMS_LDAP.init(c_ldap_host, c_ldap_port);
     r := DBMS_LDAP.open_ssl(s, c_wallet, NULL, 2);
     r := DBMS_LDAP.simple_bind_s(s, c_bind_dn, c_bind_pwd);
+    breaker_success;             -- reset failure count on a clean bind
     RETURN s;
   END;
 
@@ -230,8 +289,20 @@ CREATE OR REPLACE PACKAGE BODY ad_sync.ad_sync AS
   BEGIN
     SELECT COUNT(*) INTO n FROM DBA_USERS WHERE USERNAME = p_upn;
     IF n = 0 THEN
-      EXECUTE IMMEDIATE 'CREATE USER "' || p_upn || '" IDENTIFIED EXTERNALLY';
-      log('CREATE', 'user ' || p_upn);
+      BEGIN
+        EXECUTE IMMEDIATE 'CREATE USER "' || p_upn || '" IDENTIFIED EXTERNALLY';
+        log('CREATE', 'user ' || p_upn);
+      EXCEPTION WHEN OTHERS THEN
+        -- Concurrent first-logins of the same new principal can race here
+        -- (two AFTER LOGON triggers both see n=0). ORA-01920 = user/role name
+        -- conflict, ORA-00955 = name already used. Both mean "someone else
+        -- just created it" - benign, swallow. Anything else re-raises.
+        IF SQLCODE IN (-1920, -955) THEN
+          log('INFO', 'user ' || p_upn || ' created concurrently - ok');
+        ELSE
+          RAISE;
+        END IF;
+      END;
     ELSE
       BEGIN
         EXECUTE IMMEDIATE 'ALTER USER "' || p_upn || '" ACCOUNT UNLOCK';
@@ -296,6 +367,8 @@ CREATE OR REPLACE PACKAGE BODY ad_sync.ad_sync AS
     r_dummy := DBMS_LDAP.unbind_s(s);
     log('END', 'ad_sync.run');
   EXCEPTION WHEN OTHERS THEN
+    -- Don't double-count when the breaker itself short-circuited us.
+    IF SQLCODE != -20901 THEN breaker_failure; END IF;
     log('ERROR', 'code=' || SQLCODE || ' msg=' || SQLERRM);
     log('ERROR', 'backtrace=' || DBMS_UTILITY.FORMAT_ERROR_BACKTRACE);
     BEGIN r_dummy := DBMS_LDAP.unbind_s(s); EXCEPTION WHEN OTHERS THEN NULL; END;
@@ -326,6 +399,9 @@ CREATE OR REPLACE PACKAGE BODY ad_sync.ad_sync AS
     END LOOP;
     r_dummy := DBMS_LDAP.unbind_s(s);
   EXCEPTION WHEN OTHERS THEN
+    -- Fails OPEN by design (login proceeds; roles stay as last good). The
+    -- breaker bounds repeated exposure so a DC outage can't slow every login.
+    IF SQLCODE != -20901 THEN breaker_failure; END IF;
     log('ERROR', 'refresh(' || p_principal || ') code=' || SQLCODE || ' msg=' || SQLERRM);
     BEGIN r_dummy := DBMS_LDAP.unbind_s(s); EXCEPTION WHEN OTHERS THEN NULL; END;
   END;

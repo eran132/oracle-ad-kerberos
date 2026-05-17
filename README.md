@@ -55,7 +55,8 @@ Prove and document that an AD user can `kinit` on a Windows host, open DBeaver, 
 16. [docs/16-cmu-19c-failure-mode.md](docs/16-cmu-19c-failure-mode.md) — why this lab does NOT use Oracle Centrally Managed Users: a 19c bug crashes the CMU+Kerberos TLS init before any LDAP traffic, every documented config produces `ORA-28030`
 17. [docs/17-external-users-and-ad-sync.md](docs/17-external-users-and-ad-sync.md) — what the lab actually ships: EXTERNAL Oracle users + Oracle roles + a small `ad_sync` PL/SQL package that mirrors AD group membership over LDAPS-636 using the same wallet built for CMU
 18. *(reserved)*
-19. [docs/19-ad-admin-runbook.md](docs/19-ad-admin-runbook.md) — operations runbook for the AD / Windows team: create service accounts, register SPN, generate keytab, manage group memberships, rotate passwords
+19. [docs/19-ad-admin-runbook.md](docs/19-ad-admin-runbook.md) — operations runbook for the AD / Windows team: create service accounts, register SPN, generate keytab (incl. `-crypto`/`-ptype` explained), manage group memberships, rotate passwords
+20. [docs/20-architecture-and-hardening.md](docs/20-architecture-and-hardening.md) — architecture rationale ("Kerberos auth + LDAP-driven authorization", trade-offs), the logon-trigger fail-open decision, DNS guidance, tested version matrix, wallet risk, and a production hardening checklist
 
 Side material: [RECIPE.md](RECIPE.md) (single-page "what's deployed" cheatsheet) · [AD-SETUP-TICKET.md](AD-SETUP-TICKET.md) (corp-IT ticket template) · [troubleshooting.md](troubleshooting.md) · [screenshots/](screenshots/) · [config/windows/](config/windows/) · [config/windows/trust/](config/windows/trust/) · [scripts/windows/](scripts/windows/) · [scripts/oracle/](scripts/oracle/) (the `ad-sync-install.sql` installer) · [lab/](lab/) (workstation VM)
 

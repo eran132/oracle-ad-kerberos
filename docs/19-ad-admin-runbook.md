@@ -91,6 +91,39 @@ ktpass `
   -out .\ora01.keytab
 ```
 
+#### The two `ktpass` flags people get wrong
+
+| Flag | What it does | Why this value |
+|---|---|---|
+| `-crypto AES256-SHA1` | Which Kerberos enctype(s) `ktpass` derives into the keytab. `AES256-SHA1` = **AES256-CTS-HMAC-SHA1-96**, Kerberos etype **18**. Other accepted values: `DES-CBC-CRC`/`DES-CBC-MD5` (legacy, broken), `RC4-HMAC-NT` (etype 23, weak/deprecated), `AES128-SHA1` (etype 17), `All` (every enctype incl. weak ones). | The keytab enctype must intersect with **(a)** the account's `msDS-SupportedEncryptionTypes` (we pin AES256 in A1), **(b)** Oracle's `sqlnet.ora`, **(c)** the client `krb5.ini` `default_tkt_enctypes`. Mismatch → `KDC has no support for encryption type` or a `KRB_AP_ERR_MODIFIED`-class failure. `All` would silently ship a weak RC4 key in the keytab — don't. |
+| `-ptype KRB5_NT_PRINCIPAL` | The principal **name-type** stamped into the mapping/keytab. `KRB5_NT_PRINCIPAL` = name-type **1**, a standards-compliant general principal. Other values: `KRB5_NT_SRV_INST`/`KRB5_NT_SRV_HST` (Windows host/service-instance types), `KRB5_NT_UNKNOWN` (0). | Oracle's Kerberos adapter and MIT/Heimdal krb5 expect the SPN as a plain principal. With `KRB5_NT_SRV_HST`/`UNKNOWN` the name-type the KDC stamps into the service ticket can fail to match what Oracle's GSSAPI matches against → auth fails even when everything else is correct. `KRB5_NT_PRINCIPAL` is the documented choice for non-Windows (Oracle/Java) interop. |
+
+In one sentence: *"derive an AES256-only keytab for this SPN, named as a standard Kerberos principal so a Linux/Java service can consume it."*
+
+#### Verify the keytab really is AES256 (don't trust, check)
+
+`ktpass` historically had AES interop / salt / case quirks, and `Set-ADUser -KerberosEncryptionType AES256` does **not** by itself guarantee RC4 is refused at runtime unless domain policy agrees. Verify both ends:
+
+```powershell
+# 1. The account permits ONLY AES256 (bitmask 0x10 = 16; AES128=0x08, RC4=0x04, both AES=0x18=24).
+Get-ADUser svc-ora01 -Properties msDS-SupportedEncryptionTypes |
+  Select-Object msDS-SupportedEncryptionTypes      # expect 16
+
+# 2. The keytab actually carries etype 18 (AES256-CTS-HMAC-SHA1-96), not 23 (RC4).
+ktab.exe -l -e -t -k .\ora01.keytab                # Windows
+#   or on ora01:  sudo -u oracle klist -kte /etc/oracle/keytabs/ora01.keytab
+```
+
+If the account shows `0` (unset) AD may still hand out RC4 at runtime; explicitly set `16` and confirm the keytab line says `aes256-cts-hmac-sha1-96`. If you ever need RC4 temporarily for debugging, that's the *only* time to widen the bitmask — revert immediately after.
+
+#### SPN must match exactly what JDBC clients connect to
+
+The SPN is `oracle/ora01.mylab.local`. Clients building a Kerberos service ticket derive the SPN from the **host string in their connect descriptor**. If anyone later connects via a CNAME, short name, or load-balancer DNS (`ora01`, `db-prod`, `oracle-vip.mylab.local`) the client asks the KDC for `oracle/<that-name>` — which doesn't exist → `KDC_ERR_S_PRINCIPAL_UNKNOWN`, with no obvious clue. Rules:
+
+- Pick one canonical FQDN, register the SPN for exactly that, and make every client connect string use it verbatim.
+- If aliases are genuinely required, add an SPN per alias (`setspn -S oracle/<alias> svc-ora01`) — and re-emit/redeploy the keytab so it contains all of them.
+- Never rely on short names.
+
 **If the account / SPN already exist** (rebuild, fix, or this *is* a rotation): running the command above is exactly the right thing — `ktpass` re-derives the key, resets the password to what you type, bumps the KVNO, and emits a fresh keytab. There is no separate "update" command; create and rotate converge here. **The only failure case is a duplicate SPN** — if `setspn -Q oracle/ora01.mylab.local` (next step) returns *more than one* account, or one that is **not** `svc-ora01`, remove the SPN from the wrong account first:
 
 ```powershell

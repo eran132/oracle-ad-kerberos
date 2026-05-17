@@ -99,6 +99,22 @@ Single-page ticket version in AD-SETUP-TICKET.md.
                    -ptype KRB5_NT_PRINCIPAL `
                    -out C:\temp\ora01.keytab
 
+         FLAGS people get wrong:
+           -crypto AES256-SHA1   derive ONLY the AES256 (etype 18) key into
+                                 the keytab. Must match the account's
+                                 msDS-SupportedEncryptionTypes (=16),
+                                 sqlnet.ora, and the client krb5.ini. Never
+                                 use "All" (ships a weak RC4 key too).
+           -ptype KRB5_NT_PRINCIPAL  standards-compliant principal name-type
+                                 that Oracle/MIT/Java expect; other types
+                                 cause name-type mismatches that fail auth.
+         Full table + AES verification: docs/19-ad-admin-runbook.md sec. A2.
+         After generating, VERIFY the keytab is AES256 (klist -kte shows
+         etype 18) and Get-ADUser svc-ora01 -Properties
+         msDS-SupportedEncryptionTypes returns 16 (Set-ADUser
+         -KerberosEncryptionType AES256 alone does not guarantee RC4 is
+         refused unless domain policy agrees).
+
          ktpass ALWAYS resets the password and bumps the KVNO - that is how
          it derives the keytab key. ALREADY EXISTS / THIS IS A ROTATION:
          running this exact command is correct - create and rotate converge
@@ -120,13 +136,33 @@ Single-page ticket version in AD-SETUP-TICKET.md.
 
          ALREADY EXISTS: leave the password UNTOUCHED. Changing it without
          updating the wallet breaks the sync - that is the Part B3 rotation
-         procedure, not a re-run. Idempotent guard in
-         docs/19-ad-admin-runbook.md sec. A3.
+         procedure, not a re-run.
+
+            if (-not (Get-ADUser -Filter "SamAccountName -eq 'svc-ora-ldap'" `
+                      -ErrorAction SilentlyContinue)) {
+              $pw = Read-Host -AsSecureString "NEW password for svc-ora-ldap"
+              New-ADUser -Name svc-ora-ldap -SamAccountName svc-ora-ldap `
+                -UserPrincipalName svc-ora-ldap@MYLAB.LOCAL -AccountPassword $pw `
+                -Enabled $true -PasswordNeverExpires $true `
+                -CannotChangePassword $true -Path "CN=Users,DC=mylab,DC=local"
+            } else { Write-Host "exists - leave password (rotate via Part B3)" }
 
          Success: Get-ADUser svc-ora-ldap returns enabled.
 
  9. [AD]  Create the OU and groups: OU=Groups,DC=mylab,DC=local containing
          oracle-readers and oracle-writers (both Global Security groups).
+         Idempotent - safe to re-run (guard the OU; New-ADGroup errors
+         harmlessly if the group already exists).
+
+            if (-not (Get-ADOrganizationalUnit -Filter 'Name -eq "Groups"' `
+                      -SearchBase "DC=mylab,DC=local" -ErrorAction SilentlyContinue)) {
+              New-ADOrganizationalUnit -Name "Groups" -Path "DC=mylab,DC=local"
+            }
+            New-ADGroup -Name oracle-readers -GroupScope Global `
+              -GroupCategory Security -Path "OU=Groups,DC=mylab,DC=local"
+            New-ADGroup -Name oracle-writers -GroupScope Global `
+              -GroupCategory Security -Path "OU=Groups,DC=mylab,DC=local"
+
          Success: Get-ADGroup oracle-readers and Get-ADGroup oracle-writers
                    both return.
 

@@ -28,6 +28,26 @@ When debugging, the single most useful thing you can do is flip both `-Dsun.secu
 | `TNS:no listener` / `TNS-12541` | [#tns-12541](#tns-12541) |
 | LDAPS-related (handshake fail, chain untrusted) | [#ldaps-no-cert](#ldaps-no-cert), [#ldaps-chain-untrusted](#ldaps-chain-untrusted) |
 
+## Diagnostics matrix — symptom → layer → first command
+
+Start here. Identify the layer before diving into a section; most time is lost debugging the wrong layer.
+
+| Symptom | Likely layer | First diagnostic | Then see |
+|---|---|---|---|
+| DBeaver shows a **password prompt** at connect | Client never got/used a TGT | `klist` (MIT) and Windows `klist` — is there a `krbtgt/MYLAB.LOCAL` ticket? | [docs/06](docs/06-windows-lsa-and-ccache.md), [#ora-01017-kerberos-fallback](#ora-01017-kerberos-fallback) |
+| `ORA-01017: invalid username/password` under Kerberos | DBeaver fell back to password auth | `data-sources.json` `auth-model` (must be `oracle_native`); driver prop `oracle.net.authentication_services=KERBEROS5` (no parens) | [#ora-01017-kerberos-fallback](#ora-01017-kerberos-fallback) |
+| `ORA-12638: Credential retrieval failed` | Server-side Kerberos adapter / sqlnet | `sqlnet.ora` on ora01; `klist -kte` keytab readable by `oracle` | [#ora-12638](#ora-12638) |
+| `KRB_AP_ERR_MODIFIED` | SPN ↔ keytab key mismatch | `kvno oracle/ora01.mylab.local` vs `klist -kte` KVNO on the keytab | [#krb-ap-err-modified](#krb-ap-err-modified) |
+| `KDC_ERR_S_PRINCIPAL_UNKNOWN` | SPN not registered / wrong host string / duplicate | `setspn -Q oracle/ora01.mylab.local`; `setspn -X` | [#kdc-err-s-principal-unknown](#kdc-err-s-principal-unknown), [#duplicate-spn](#duplicate-spn) |
+| `KRB_AP_ERR_SKEW` / clock errors | Time | `w32tm /stripchart` (Win) / `chronyc tracking` (ora01) | [#clock-skew](#clock-skew) |
+| Intermittent Kerberos failures, no clear error | DNS / reverse DNS | `host <fqdn>` and `host <ip>` must agree | [docs/20 §3](docs/20-architecture-and-hardening.md) |
+| JDBC `EncryptionKey: Key bytes cannot be null` | JVM ↔ MIT Kerberos delegation path | `krb5.ini` — is `forwardable = false`? | [#jdbc-encryptionkey-null](#jdbc-encryptionkey-null) |
+| `cannot access class sun.security.krb5...` | JVM module access (Java 17+) | `dbeaver.ini` — is the full `--add-opens` set present? | [#jdbc-module-access](#jdbc-module-access) |
+| Authenticates fine but **has no privileges / wrong role** | `ad_sync` / LDAP authorization | `SELECT lvl,msg FROM ad_sync.ad_sync_log ORDER BY ts` (look for `ERROR`, rc=49) | [docs/17](docs/17-external-users-and-ad-sync.md) |
+| `ORA-24247` from the sync package | Missing network ACL | `SELECT host,principal,privilege FROM dba_host_aces` | [#ora-24247](#ora-24247) |
+| `ORA-28030` | CMU enabled and broken (19c) | confirm `LDAP_DIRECTORY_ACCESS` — should be `NONE` for the ad_sync model | [#ora-28030](#ora-28030), [docs/16](docs/16-cmu-19c-failure-mode.md) |
+| LDAPS handshake / chain errors | Wallet trust ↔ DC cert | `openssl s_client -connect ad1.mylab.local:636` | [#ldaps-no-cert](#ldaps-no-cert), [#ldaps-chain-untrusted](#ldaps-chain-untrusted) |
+
 ---
 
 ## clock-skew

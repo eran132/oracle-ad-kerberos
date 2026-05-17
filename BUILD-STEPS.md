@@ -37,13 +37,34 @@ Lab placeholders to search-replace for a real environment: `MYLAB.LOCAL` / `myla
           -pass * -crypto AES256-SHA1 -ptype KRB5_NT_PRINCIPAL `
           -out C:\temp\ora01.keytab
    ```
-   `ktpass` **always** resets the password and bumps the KVNO — that's how it derives the keytab key. **If the account/SPN already exist or this is a rotation**, running this exact command is correct: create and rotate converge here, there is no separate "update" command. Only special case: a **duplicate SPN** — if the verify below shows >1 account or the wrong one, `setspn -D oracle/ora01.mylab.local <WRONG-account>` for each wrong holder, then re-run the `ktpass` above.
+   The two flags people get wrong: **`-crypto AES256-SHA1`** = derive only the AES256 (etype 18) key into the keytab — must match the account's `msDS-SupportedEncryptionTypes` (=16), `sqlnet.ora`, and the client `krb5.ini`; never use `All` (ships a weak RC4 key). **`-ptype KRB5_NT_PRINCIPAL`** = standards-compliant principal name-type that Oracle/MIT/Java expect; other types cause name-type mismatches that fail auth. Full table + AES verification in [docs/19 §A2](docs/19-ad-admin-runbook.md).
+
+   `ktpass` **always** resets the password and bumps the KVNO — that's how it derives the keytab key. **If the account/SPN already exist or this is a rotation**, running this exact command is correct: create and rotate converge here, there is no separate "update" command. Only special case: a **duplicate SPN** — if the verify below shows >1 account or the wrong one, `setspn -D oracle/ora01.mylab.local <WRONG-account>` for each wrong holder, then re-run the `ktpass` above. After generating, **verify the keytab is actually AES256** (`ktab -l -e -t -k` / `klist -kte` shows etype 18) and `Get-ADUser svc-ora01 -Properties msDS-SupportedEncryptionTypes` returns 16 — `Set-ADUser -KerberosEncryptionType AES256` alone does not guarantee RC4 is refused unless domain policy agrees.
    - **Success:** `setspn -Q oracle/ora01.mylab.local` returns **exactly one** account (`CN=svc-ora01,...`). `setspn -X` reports zero duplicates.
 
-8. **[AD]** Create `svc-ora-ldap` service account (Oracle binds to AD over LDAPS with it for group lookups). Default `Domain Users` privileges are sufficient. Unlike `svc-ora01` this account has **no keytab** — its password is used directly by Oracle (loaded into the wallet in step 18), so the password set here **is authoritative**; record it and hand it to the DBA out-of-band. **If it already exists**: leave the password untouched (changing it without updating the wallet breaks the sync — that's the Part B3 rotation procedure, not a re-run). Idempotent guard in [docs/19 §A3](docs/19-ad-admin-runbook.md).
+8. **[AD]** Create `svc-ora-ldap` service account (Oracle binds to AD over LDAPS with it for group lookups). Default `Domain Users` privileges are sufficient. Unlike `svc-ora01` this account has **no keytab** — its password is used directly by Oracle (loaded into the wallet in step 18), so the password set here **is authoritative**; record it and hand it to the DBA out-of-band. **If it already exists**: leave the password untouched (changing it without updating the wallet breaks the sync — that's the Part B3 rotation procedure, not a re-run; idempotent guard in [docs/19 §A3](docs/19-ad-admin-runbook.md)).
+   ```powershell
+   if (-not (Get-ADUser -Filter "SamAccountName -eq 'svc-ora-ldap'" -ErrorAction SilentlyContinue)) {
+     $pw = Read-Host -AsSecureString "NEW password for svc-ora-ldap (vault; give to DBA)"
+     New-ADUser -Name svc-ora-ldap -SamAccountName svc-ora-ldap `
+       -UserPrincipalName svc-ora-ldap@MYLAB.LOCAL -AccountPassword $pw `
+       -Enabled $true -PasswordNeverExpires $true -CannotChangePassword $true `
+       -Path "CN=Users,DC=mylab,DC=local"
+   } else { Write-Host "exists - leaving password untouched (rotate via Part B3)" }
+   ```
    - **Success:** `Get-ADUser svc-ora-ldap` returns enabled.
 
-9. **[AD]** Create the OU and groups: `OU=Groups,DC=mylab,DC=local` containing `oracle-readers` and `oracle-writers` (both Global Security groups).
+9. **[AD]** Create the OU and groups: `OU=Groups,DC=mylab,DC=local` containing `oracle-readers` and `oracle-writers` (both Global Security groups). Idempotent — safe to re-run (`New-ADGroup`/`New-ADOrganizationalUnit` error harmlessly if the object already exists; guard the OU as shown).
+   ```powershell
+   if (-not (Get-ADOrganizationalUnit -Filter 'Name -eq "Groups"' `
+             -SearchBase "DC=mylab,DC=local" -ErrorAction SilentlyContinue)) {
+     New-ADOrganizationalUnit -Name "Groups" -Path "DC=mylab,DC=local"
+   }
+   New-ADGroup -Name oracle-readers -GroupScope Global -GroupCategory Security `
+     -Path "OU=Groups,DC=mylab,DC=local" -Description "Members get SELECT on ORCLPDB1"
+   New-ADGroup -Name oracle-writers -GroupScope Global -GroupCategory Security `
+     -Path "OU=Groups,DC=mylab,DC=local" -Description "Members get DML on ORCLPDB1"
+   ```
    - **Success:** `Get-ADGroup oracle-readers` and `Get-ADGroup oracle-writers` both return.
 
 10. **[AD]** Add the test users to the groups (assumes `alice`, `bob`, `carol` already exist as normal AD users with `UserPrincipalName` set):

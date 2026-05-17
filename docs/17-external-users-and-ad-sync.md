@@ -1,6 +1,6 @@
 # 17 · External users + AD-driven sync (the working Kerberos pattern)
 
-This is what the lab actually ships. See chapter [16](16-cmu-19c-failure-mode.md) for why we do not use Oracle Centrally Managed Users (CMU) on 19c.
+This is what the lab actually ships. See chapter [16](16-cmu-19c-failure-mode.md) for why we do not use Oracle Centrally Managed Users (CMU) on 19c, and chapter [20](20-architecture-and-hardening.md) for the architecture rationale (this is **Kerberos authentication + LDAP-driven authorization/materialization**, not native CMU), the fail-open trigger decision, and the production hardening checklist.
 
 > **End-user behaviour is identical to CMU:** Windows-logged-in AD user opens DBeaver, hits ENTER, runs queries; no Oracle password, no `kinit`, privileges come from AD group membership. The only differences are operational, behind the scenes.
 
@@ -162,7 +162,9 @@ END;
 /
 ```
 
-Fires for every Kerberos-authenticated external user. Adds two LDAP searches (~5 ms typical) to each connect. The `WHEN OTHERS THEN NULL` is deliberate — a transient AD outage must not lock people out of the database; they'll fall back to whatever role grants existed from the last successful sync.
+Fires for every Kerberos-authenticated external user. Adds two LDAP searches (~5 ms typical) to each connect. The `WHEN OTHERS THEN NULL` is deliberate — a transient AD outage must not lock people out of the database; they'll fall back to whatever role grants existed from the last successful sync (this is **fail-open by design** — see [chapter 20 §2](20-architecture-and-hardening.md) for why fail-closed here would be an auth-DoS).
+
+A **circuit breaker** in the package backs this up: after 3 consecutive LDAP failures `ldap_open()` fails fast for a 300 s cooldown *without* touching the network, so a sustained DC outage cannot add bind latency to every login; it self-resets on the first good bind. `ensure_user` also guards the concurrent-first-login `CREATE USER` race. With these shipped the trigger is production-acceptable; **scheduler-only** (disable this trigger, keep the 10-min job) remains the conservative default if you want the login path fully decoupled from LDAP. Details + tunables: [chapter 20 §2](20-architecture-and-hardening.md).
 
 ---
 
