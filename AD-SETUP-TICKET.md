@@ -34,19 +34,33 @@ Import-Module ActiveDirectory
 # 1) SPN service account: svc-ora01
 #    Holds the Oracle Kerberos service principal. Its long-term key becomes
 #    the keytab on the Oracle server. No human ever logs in as this account.
+#
+#    The password set HERE is a throwaway placeholder -- AD won't create an
+#    enabled account with no password, but step 2's ktpass immediately resets
+#    it to the value that actually counts. Do not record this one.
+#    Idempotent: if the account already exists we normalize it instead of
+#    failing (safe to re-run for rebuilds / fixes).
 # ============================================================================
-$spnPw = Read-Host -AsSecureString "Password for svc-ora01"
-New-ADUser `
-  -Name "svc-ora01" `
-  -SamAccountName "svc-ora01" `
-  -UserPrincipalName "svc-ora01@MYLAB.LOCAL" `
-  -DisplayName "Oracle Kerberos SPN service (ora01)" `
-  -Description "Holds SPN oracle/ora01.mylab.local. Keytab lives on ora01:/etc/oracle/keytabs/" `
-  -AccountPassword $spnPw `
-  -Enabled $true `
-  -PasswordNeverExpires $true `
-  -CannotChangePassword $true `
-  -Path "CN=Users,DC=mylab,DC=local"
+$throwaway = ConvertTo-SecureString ([guid]::NewGuid().ToString() + 'Aa1!') -AsPlainText -Force
+if (Get-ADUser -Filter "SamAccountName -eq 'svc-ora01'" -ErrorAction SilentlyContinue) {
+  Write-Host "svc-ora01 exists -- normalizing (password set by ktpass in step 2)."
+  Enable-ADAccount -Identity svc-ora01
+  Set-ADUser -Identity svc-ora01 `
+    -UserPrincipalName "svc-ora01@MYLAB.LOCAL" `
+    -PasswordNeverExpires $true -CannotChangePassword $true
+} else {
+  New-ADUser `
+    -Name "svc-ora01" `
+    -SamAccountName "svc-ora01" `
+    -UserPrincipalName "svc-ora01@MYLAB.LOCAL" `
+    -DisplayName "Oracle Kerberos SPN service (ora01)" `
+    -Description "Holds SPN oracle/ora01.mylab.local. Keytab lives on ora01:/etc/oracle/keytabs/" `
+    -AccountPassword $throwaway `
+    -Enabled $true `
+    -PasswordNeverExpires $true `
+    -CannotChangePassword $true `
+    -Path "CN=Users,DC=mylab,DC=local"
+}
 
 # Force AES-256 only (no RC4)
 Set-ADUser -Identity svc-ora01 -KerberosEncryptionType "AES256"
@@ -54,14 +68,22 @@ Set-ADUser -Identity svc-ora01 -KerberosEncryptionType "AES256"
 
 # ============================================================================
 # 2) Register the SPN AND emit the keytab in one step.
-#    NOTE: ktpass resets the account password as a side effect -- pass the
-#    SAME password you set in step 1.
+#    ktpass ALWAYS resets the account password and bumps the KVNO -- that is
+#    how it derives the Kerberos key it writes into the keytab. The value you
+#    type at the -pass * prompt is the AUTHORITATIVE one: store it in the
+#    password vault, the next keytab rotation needs it.
+#
+#    -pass *  => ktpass prompts (hidden); password never hits the command
+#                line, console history, or the process list.
+#
+#    Already exists / this is a rotation: running this exact command is the
+#    right thing -- create and rotate converge here. The only failure case is
+#    a DUPLICATE SPN; see the cleanup just below the verify line.
 # ============================================================================
-$spnPwPlain = "<paste the same password you set above, in plain text just for this command>"
 ktpass `
   -princ oracle/ora01.mylab.local@MYLAB.LOCAL `
   -mapuser MYLAB\svc-ora01 `
-  -pass $spnPwPlain `
+  -pass * `
   -crypto AES256-SHA1 `
   -ptype KRB5_NT_PRINCIPAL `
   -out C:\temp\ora01.keytab
@@ -69,6 +91,10 @@ ktpass `
 # Verify there is exactly ONE account with this SPN:
 setspn -Q oracle/ora01.mylab.local
 # Expected single line: CN=svc-ora01,CN=Users,DC=mylab,DC=local
+#
+# If it returns MORE THAN ONE account, or an account that is NOT svc-ora01,
+# remove the SPN from each wrong holder then re-run the ktpass command above:
+#   setspn -D oracle/ora01.mylab.local <WRONG-account>
 
 
 # ============================================================================
@@ -76,19 +102,34 @@ setspn -Q oracle/ora01.mylab.local
 #    The Oracle database binds to AD over LDAPS with this account to read
 #    user group memberships. No elevated privileges needed -- default
 #    "Domain Users" Read access is sufficient.
+#
+#    UNLIKE svc-ora01, this account has NO keytab. Its password is used
+#    directly by Oracle (loaded into the wallet on ora01), so the password
+#    set here IS authoritative -- store it in the vault and give it to the
+#    DBA out-of-band. Idempotent guard: on re-run we DO NOT touch the
+#    password (changing it without updating the wallet breaks the sync).
 # ============================================================================
-$ldapPw = Read-Host -AsSecureString "Password for svc-ora-ldap"
-New-ADUser `
-  -Name "svc-ora-ldap" `
-  -SamAccountName "svc-ora-ldap" `
-  -UserPrincipalName "svc-ora-ldap@MYLAB.LOCAL" `
-  -DisplayName "Oracle LDAPS bind account for AD-group sync" `
-  -Description "Used by ora01's PL/SQL ad_sync package to read memberOf over LDAPS-636" `
-  -AccountPassword $ldapPw `
-  -Enabled $true `
-  -PasswordNeverExpires $true `
-  -CannotChangePassword $true `
-  -Path "CN=Users,DC=mylab,DC=local"
+if (Get-ADUser -Filter "SamAccountName -eq 'svc-ora-ldap'" -ErrorAction SilentlyContinue) {
+  Write-Host "svc-ora-ldap exists -- leaving password untouched (rotate via the"
+  Write-Host "DBA runbook Part B3, which also updates the Oracle wallet)."
+  Enable-ADAccount -Identity svc-ora-ldap
+  Set-ADUser -Identity svc-ora-ldap `
+    -UserPrincipalName "svc-ora-ldap@MYLAB.LOCAL" `
+    -PasswordNeverExpires $true -CannotChangePassword $true
+} else {
+  $ldapPw = Read-Host -AsSecureString "NEW password for svc-ora-ldap (vault + give to DBA)"
+  New-ADUser `
+    -Name "svc-ora-ldap" `
+    -SamAccountName "svc-ora-ldap" `
+    -UserPrincipalName "svc-ora-ldap@MYLAB.LOCAL" `
+    -DisplayName "Oracle LDAPS bind account for AD-group sync" `
+    -Description "Used by ora01's PL/SQL ad_sync package to read memberOf over LDAPS-636" `
+    -AccountPassword $ldapPw `
+    -Enabled $true `
+    -PasswordNeverExpires $true `
+    -CannotChangePassword $true `
+    -Path "CN=Users,DC=mylab,DC=local"
+}
 
 
 # ============================================================================

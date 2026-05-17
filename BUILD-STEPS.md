@@ -28,18 +28,19 @@ Lab placeholders to search-replace for a real environment: `MYLAB.LOCAL` / `myla
 
 > Full PowerShell snippets in [docs/19-ad-admin-runbook.md](docs/19-ad-admin-runbook.md). Single-page ticket version in [AD-SETUP-TICKET.md](AD-SETUP-TICKET.md).
 
-6. **[AD]** Create `svc-ora01` service account: `New-ADUser -Name svc-ora01 -UserPrincipalName svc-ora01@MYLAB.LOCAL -Enabled $true -PasswordNeverExpires $true ...` + `Set-ADUser -KerberosEncryptionType AES256`.
+6. **[AD]** Create `svc-ora01` service account with a **throwaway** password (it's only a placeholder — AD won't create an enabled account without one; step 7's `ktpass` resets it to the value that counts). `New-ADUser -Name svc-ora01 -UserPrincipalName svc-ora01@MYLAB.LOCAL -AccountPassword <random> -Enabled $true -PasswordNeverExpires $true ...` then `Set-ADUser -KerberosEncryptionType AES256`. **If it already exists** (rebuild/fix): skip `New-ADUser`, just `Enable-ADAccount` + `Set-ADUser -KerberosEncryptionType AES256` (idempotent guard shown in [docs/19 §A1](docs/19-ad-admin-runbook.md)).
    - **Success:** `Get-ADUser svc-ora01` returns; `msDS-SupportedEncryptionTypes` = 16.
 
-7. **[AD]** Register the Oracle SPN and emit the keytab in one shot with `ktpass`:
+7. **[AD]** Register the Oracle SPN and emit the keytab in one shot with `ktpass`. Use **`-pass *`** so it prompts (hidden) — this is the **authoritative** password; **record it in your password vault** (the next keytab rotation needs account + keytab to agree):
    ```powershell
    ktpass -princ oracle/ora01.mylab.local@MYLAB.LOCAL -mapuser MYLAB\svc-ora01 `
-          -pass <password> -crypto AES256-SHA1 -ptype KRB5_NT_PRINCIPAL `
+          -pass * -crypto AES256-SHA1 -ptype KRB5_NT_PRINCIPAL `
           -out C:\temp\ora01.keytab
    ```
+   `ktpass` **always** resets the password and bumps the KVNO — that's how it derives the keytab key. **If the account/SPN already exist or this is a rotation**, running this exact command is correct: create and rotate converge here, there is no separate "update" command. Only special case: a **duplicate SPN** — if the verify below shows >1 account or the wrong one, `setspn -D oracle/ora01.mylab.local <WRONG-account>` for each wrong holder, then re-run the `ktpass` above.
    - **Success:** `setspn -Q oracle/ora01.mylab.local` returns **exactly one** account (`CN=svc-ora01,...`). `setspn -X` reports zero duplicates.
 
-8. **[AD]** Create `svc-ora-ldap` service account (Oracle uses this to bind to AD over LDAPS for group lookups). Default `Domain Users` privileges are sufficient.
+8. **[AD]** Create `svc-ora-ldap` service account (Oracle binds to AD over LDAPS with it for group lookups). Default `Domain Users` privileges are sufficient. Unlike `svc-ora01` this account has **no keytab** — its password is used directly by Oracle (loaded into the wallet in step 18), so the password set here **is authoritative**; record it and hand it to the DBA out-of-band. **If it already exists**: leave the password untouched (changing it without updating the wallet breaks the sync — that's the Part B3 rotation procedure, not a re-run). Idempotent guard in [docs/19 §A3](docs/19-ad-admin-runbook.md).
    - **Success:** `Get-ADUser svc-ora-ldap` returns enabled.
 
 9. **[AD]** Create the OU and groups: `OU=Groups,DC=mylab,DC=local` containing `oracle-readers` and `oracle-writers` (both Global Security groups).

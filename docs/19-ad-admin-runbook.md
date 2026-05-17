@@ -41,19 +41,30 @@ Plus existing infrastructure that should already be present in a typical corpora
 
 ### A1. Create the SPN service account `svc-ora01`
 
+The password set here is a **throwaway placeholder** — AD won't create an *enabled* account with no password, but `ktpass` in A2 immediately resets it to the value that actually counts. Don't bother recording this one.
+
 ```powershell
-$pw = Read-Host -AsSecureString "Password for svc-ora01"
-New-ADUser `
-  -Name "svc-ora01" `
-  -SamAccountName "svc-ora01" `
-  -UserPrincipalName "svc-ora01@MYLAB.LOCAL" `
-  -DisplayName "Oracle Kerberos SPN service (ora01)" `
-  -Description "Holds SPN oracle/ora01.mylab.local. Keytab on ora01:/etc/oracle/keytabs/" `
-  -AccountPassword $pw `
-  -Enabled $true `
-  -PasswordNeverExpires $true `
-  -CannotChangePassword $true `
-  -Path "CN=Users,DC=mylab,DC=local"
+# Idempotent: skip creation if the account already exists (rebuild / re-run safe).
+$throwaway = ConvertTo-SecureString ([guid]::NewGuid().ToString() + 'Aa1!') -AsPlainText -Force
+if (Get-ADUser -Filter "SamAccountName -eq 'svc-ora01'" -ErrorAction SilentlyContinue) {
+  Write-Host "svc-ora01 already exists — normalizing its state instead of creating."
+  Enable-ADAccount -Identity svc-ora01
+  Set-ADUser -Identity svc-ora01 `
+    -UserPrincipalName "svc-ora01@MYLAB.LOCAL" `
+    -PasswordNeverExpires $true -CannotChangePassword $true
+} else {
+  New-ADUser `
+    -Name "svc-ora01" `
+    -SamAccountName "svc-ora01" `
+    -UserPrincipalName "svc-ora01@MYLAB.LOCAL" `
+    -DisplayName "Oracle Kerberos SPN service (ora01)" `
+    -Description "Holds SPN oracle/ora01.mylab.local. Keytab on ora01:/etc/oracle/keytabs/" `
+    -AccountPassword $throwaway `
+    -Enabled $true `
+    -PasswordNeverExpires $true `
+    -CannotChangePassword $true `
+    -Path "CN=Users,DC=mylab,DC=local"
+}
 
 # Enable AES-256 only (RC4 disabled). Bitmask 0x10 = AES256-CTS-HMAC-SHA1-96.
 Set-ADUser -Identity svc-ora01 -KerberosEncryptionType "AES256"
@@ -63,29 +74,29 @@ Set-ADUser -Identity svc-ora01 -KerberosEncryptionType "AES256"
 
 ### A2. Register the Oracle SPN and generate the keytab
 
-`ktpass.exe` does both in one shot. **It will reset the account password as a side effect** — pass the same password you set above so the AD state and the keytab agree.
+`ktpass.exe` does both in one shot. **It always resets the account password and bumps the KVNO** — that is inherent to how it derives the Kerberos key written into the keytab. The throwaway password from A1 is now irrelevant; the value you supply here is the **authoritative** one. **Record it in your password vault** — the next keytab rotation needs the account and keytab to agree again.
+
+Use `-pass *` so `ktpass` prompts interactively: the password never lands in the command line, console history, or process list.
 
 ```powershell
-# Run on the DC. The keytab will be written to .\ora01.keytab in the current dir.
-# Read the password from a secure prompt rather than pasting it on the command
-# line (ktpass's -pass takes plaintext, so we marshal a SecureString -> plain
-# at the last possible moment and zero the variable afterwards).
-$sec = Read-Host -AsSecureString "Password for svc-ora01 (same as in A1)"
-$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-$plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-try {
-  ktpass `
-    -princ oracle/ora01.mylab.local@MYLAB.LOCAL `
-    -mapuser MYLAB\svc-ora01 `
-    -pass $plain `
-    -crypto AES256-SHA1 `
-    -ptype KRB5_NT_PRINCIPAL `
-    -out .\ora01.keytab
-}
-finally {
-  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-  Remove-Variable plain -ErrorAction SilentlyContinue
-}
+# Run on the DC. The keytab is written to .\ora01.keytab in the current dir.
+# -pass *  => ktpass prompts (hidden). This is the password that COUNTS;
+#             store it in the password vault.
+ktpass `
+  -princ oracle/ora01.mylab.local@MYLAB.LOCAL `
+  -mapuser MYLAB\svc-ora01 `
+  -pass * `
+  -crypto AES256-SHA1 `
+  -ptype KRB5_NT_PRINCIPAL `
+  -out .\ora01.keytab
+```
+
+**If the account / SPN already exist** (rebuild, fix, or this *is* a rotation): running the command above is exactly the right thing — `ktpass` re-derives the key, resets the password to what you type, bumps the KVNO, and emits a fresh keytab. There is no separate "update" command; create and rotate converge here. **The only failure case is a duplicate SPN** — if `setspn -Q oracle/ora01.mylab.local` (next step) returns *more than one* account, or one that is **not** `svc-ora01`, remove the SPN from the wrong account first:
+
+```powershell
+setspn -Q oracle/ora01.mylab.local      # see who currently holds it
+setspn -D oracle/ora01.mylab.local <WRONG-account>   # repeat per wrong holder
+# then re-run the ktpass command above so svc-ora01 holds it cleanly.
 ```
 
 **Verify the SPN is now registered** (must return exactly one user, `svc-ora01`):
@@ -118,25 +129,39 @@ sudo -u oracle klist -kte /etc/oracle/keytabs/ora01.keytab   # confirm
 
 ### A3. Create the LDAP-bind service account `svc-ora-ldap`
 
-This account is what the database uses to **read AD users' group memberships** (for the `ad_sync` reconciliation job). It does *not* need any elevated privileges — just "Read properties" on user objects in the search base.
+This account is what the database uses to **read AD users' group memberships** (for the `ad_sync` reconciliation job). It does *not* need any elevated privileges — just "Read properties" on user objects in the search base. Unlike `svc-ora01`, this account has **no keytab and no SPN** — its password is used directly by Oracle (loaded into the wallet on `ora01`), so the password you set here **is** the authoritative one. Record it in your password vault and hand it to the Oracle DBA out-of-band.
 
 ```powershell
-$pw = Read-Host -AsSecureString "Password for svc-ora-ldap"
-New-ADUser `
-  -Name "svc-ora-ldap" `
-  -SamAccountName "svc-ora-ldap" `
-  -UserPrincipalName "svc-ora-ldap@MYLAB.LOCAL" `
-  -DisplayName "Oracle CMU/AD-sync LDAPS bind account" `
-  -Description "Used by ora01 ad_sync package to read group memberships over LDAPS-636" `
-  -AccountPassword $pw `
-  -Enabled $true `
-  -PasswordNeverExpires $true `
-  -CannotChangePassword $true `
-  -Path "CN=Users,DC=mylab,DC=local"
+# Idempotent: reuse the account if it already exists; only set the password
+# if creating fresh (re-runs must not silently change the bind password the
+# DBA already loaded into the wallet).
+if (Get-ADUser -Filter "SamAccountName -eq 'svc-ora-ldap'" -ErrorAction SilentlyContinue) {
+  Write-Host "svc-ora-ldap already exists — leaving its password untouched."
+  Write-Host "If you need to rotate it, use Part B3 (it also updates the wallet)."
+  Enable-ADAccount -Identity svc-ora-ldap
+  Set-ADUser -Identity svc-ora-ldap `
+    -UserPrincipalName "svc-ora-ldap@MYLAB.LOCAL" `
+    -PasswordNeverExpires $true -CannotChangePassword $true
+} else {
+  $pw = Read-Host -AsSecureString "NEW password for svc-ora-ldap (store in vault; give to DBA)"
+  New-ADUser `
+    -Name "svc-ora-ldap" `
+    -SamAccountName "svc-ora-ldap" `
+    -UserPrincipalName "svc-ora-ldap@MYLAB.LOCAL" `
+    -DisplayName "Oracle CMU/AD-sync LDAPS bind account" `
+    -Description "Used by ora01 ad_sync package to read group memberships over LDAPS-636" `
+    -AccountPassword $pw `
+    -Enabled $true `
+    -PasswordNeverExpires $true `
+    -CannotChangePassword $true `
+    -Path "CN=Users,DC=mylab,DC=local"
+}
 
 # Optional but recommended: restrict where this account can log on (i.e., not interactive logon anywhere).
 # Set-ADUser -Identity svc-ora-ldap -LogonWorkstations "DOES-NOT-EXIST"
 ```
+
+> **Why `svc-ora01` and `svc-ora-ldap` differ on re-run.** `svc-ora01`'s password is *expected* to change every time `ktpass` runs (the keytab is regenerated to match, so nothing breaks). `svc-ora-ldap`'s password must **not** change on a re-run — Oracle's wallet on `ora01` holds a copy, and changing it in AD without simultaneously updating the wallet (Part B3) breaks the sync with an LDAP bind failure (rc=49). Hence the idempotent guard above only sets the password when creating the account for the first time.
 
 > The account is a "Domain User" by default. That role already grants "Read properties" on most user attributes in `CN=Users,DC=mylab,DC=local`. If your AD has restrictive ACLs on `CN=Users` or custom OUs, explicitly grant `Read` to `svc-ora-ldap` on the user OUs that contain Oracle-relevant accounts.
 
