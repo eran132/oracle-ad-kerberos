@@ -41,6 +41,21 @@ You **must reset the account's password after changing enctypes**, otherwise the
 
 The verification script [scripts/windows/Test-SpnLookup.ps1](../scripts/windows/Test-SpnLookup.ps1) checks the AES256 bit via RSAT `Get-ADUser`.
 
+## Naming & case conventions (read this before the SPN section)
+
+The strings in `oracle/ora01.mylab.local@MYLAB.LOCAL` come from **two different identifier namespaces** with different case rules. The mixed case is not styling — it is the visible boundary between them, and getting it wrong breaks authentication.
+
+| Part | Namespace | Case rule | Consequence of getting it wrong |
+|---|---|---|---|
+| `ora01.mylab.local`, `mylab.local` | **DNS** | lowercase by convention; DNS is case-**insensitive** | Resolves regardless, but the **SPN is matched as a literal string** — a client connecting to `ORA01...` asks the KDC for `oracle/ORA01...`, which isn't registered → `KDC_ERR_S_PRINCIPAL_UNKNOWN`. Keep host lowercase and identical everywhere. |
+| `MYLAB.LOCAL` (after `@`) | **Kerberos realm** | **UPPERCASE — load-bearing** | A realm is an opaque, **case-sensitive** string (RFC 4120). AD's realm *is literally the uppercased DNS domain*; there is no realm `mylab.local`. Lowercase in `krb5.ini`/`krb5.conf` → "Cannot find KDC for realm" / `KDC_ERR_S_PRINCIPAL_UNKNOWN`. |
+
+Corollaries:
+
+- The Oracle external username is `"ALICE@MYLAB.LOCAL"` (uppercase). The `@MYLAB.LOCAL` is **part of the identity**, not decoration — because `OS_AUTHENT_PREFIX=''`, the user *is* `ALICE@MYLAB.LOCAL`. Realm/UPN-suffix renames are therefore painful (every external user's name embeds it) — see [docs/20 §6](20-architecture-and-hardening.md).
+- `kinit alice` works (it appends the default realm from `krb5.conf`); `kinit alice@MYLAB.LOCAL` is just the explicit, unambiguous form.
+- One-line rule: **lowercase = DNS (case-insensitive, convention); UPPERCASE = Kerberos realm (case-sensitive, AD's actual realm string)**. Mixing them up is a top cause of "mysterious" Kerberos failures.
+
 ## The SPN
 
 Two SPNs are registered, both on `svc-ora01`:
@@ -75,6 +90,8 @@ ktpass `
   -ptype KRB5_NT_PRINCIPAL `
   -out C:\path\ora01.keytab
 ```
+
+> **`-ptype KRB5_NT_PRINCIPAL`** sets the principal *name-type* — metadata telling Kerberos how to interpret the name. `KRB5_NT_PRINCIPAL` = "general principal, use the name **literally, no canonicalization**", which is mandatory because Oracle/MIT/Java match the SPN in the keytab byte-for-byte against the client's service ticket. The host-based type `KRB5_NT_SRV_HST` lets the KDC/clients canonicalize the hostname (reverse-DNS, case-fold) and the rewritten name then ≠ the keytab entry → `KRB5KRB_AP_ERR_*`/GSS failures. Microsoft marks `KRB5_NT_PRINCIPAL` "(recommended)". Full per-flag rationale incl. `-crypto`: [docs/19 §A2](19-ad-admin-runbook.md).
 
 Effect on AD:
 - Sets `svc-ora01`'s password to the supplied value.

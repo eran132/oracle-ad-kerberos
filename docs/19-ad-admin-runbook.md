@@ -72,6 +72,8 @@ Set-ADUser -Identity svc-ora01 -KerberosEncryptionType "AES256"
 
 > `PasswordNeverExpires` is intentional — `ktpass` rotation cycles are deliberate, and an unattended expiry would break Oracle Kerberos auth lab-wide. If your policy forbids this, schedule the keytab rotation (Part B2) to track the password policy.
 
+> **Do NOT set "Trust this account for delegation" on `svc-ora01`** (nor on `svc-ora-ldap`). This setup never performs a second Kerberos hop *as the end user* — Oracle's only outbound bind uses `svc-ora-ldap`'s own credential, not a forwarded user ticket. Delegation is unnecessary and unconstrained delegation here would be a serious attack surface (compromise of `ora01` → harvest every connecting user's forwarded TGT). AD accounts are not delegation-trusted by default; the correct action is to leave it off and confirm it stays off. Full rationale + verification command: [docs/20 §7](20-architecture-and-hardening.md).
+
 ### A2. Register the Oracle SPN and generate the keytab
 
 `ktpass.exe` does both in one shot. **It always resets the account password and bumps the KVNO** — that is inherent to how it derives the Kerberos key written into the keytab. The throwaway password from A1 is now irrelevant; the value you supply here is the **authoritative** one. **Record it in your password vault** — the next keytab rotation needs the account and keytab to agree again.
@@ -123,6 +125,16 @@ ktab.exe -l -e -t -k .\ora01.keytab                # Windows
 ```
 
 If the account shows `0` (unset) AD may still hand out RC4 at runtime; explicitly set `16` and confirm the keytab line says `aes256-cts-hmac-sha1-96`. If you ever need RC4 temporarily for debugging, that's the *only* time to widen the bitmask — revert immediately after.
+
+#### Why not `-crypto All`?
+
+`-crypto All` writes **every** enctype key into the keytab (DES-CBC-CRC, DES-CBC-MD5, RC4-HMAC-NT, AES128, AES256). It looks convenient ("it'll work no matter what gets negotiated") but that is the bug, not the feature — you *want* strong-or-fail. Three concrete harms:
+
+1. **Weak key material at rest.** The keytab on `ora01` is the service's crown-jewel secret. With `All` it now also contains the **RC4 and DES long-term keys** for the SPN. Anyone who can read the keytab (filesystem compromise, an unencrypted backup, over-broad `sudo`) gets attackable weak keys, not just the strong one. AES256-only means there is no weak key material on disk to steal in the first place.
+2. **Re-opens the downgrade path.** Enctype is negotiated. If both the keytab *and* the AD account carry RC4, a malicious or MITM client can request an RC4 service ticket and the server will accept it (it holds the key). Pinning AES256 on **both** ends removes the negotiation entirely. `All` deliberately reintroduces "…or fall back to RC4."
+3. **Inconsistent account state.** `ktpass -crypto All` also nudges the account's supported-enctypes/DES attributes toward "everything," contradicting the `Set-ADUser -KerberosEncryptionType AES256` from A1 and producing a muddled state that's hard to reason about. One declared enctype keeps account ⇄ keytab ⇄ `sqlnet.ora` ⇄ client `krb5.ini` provably in agreement.
+
+Defense-in-depth note: if the AD account is AES256-only, the KDC won't *issue* RC4 tickets for that SPN even if the keytab had `All` — so the **account pin is the primary enforcement**. We still pin the keytab to AES256-only as well so there is no weak key material at rest, ever. Microsoft's docs example uses `/crypto all` only to make a demo connect; their normative guidance is merely *"always use the `/crypto` parameter"* (don't rely on weak MIT-era defaults) — it does not endorse `all`.
 
 #### SPN must match exactly what JDBC clients connect to
 
@@ -315,6 +327,17 @@ sqlplus / as sysdba <<<'ALTER SESSION SET CONTAINER=orclpdb1; EXEC ad_sync.ad_sy
 ```
 
 If the wallet is out of sync, you'll see `ORA-28030` returning to DBeaver users, and `AD_SYNC.AD_SYNC_LOG` will show LDAP bind failures with rc=49 ("Invalid Credentials").
+
+#### Automating this rotation — design & the four gotchas
+
+It *can* be automated (a single idempotent `rotate-svc-ora-ldap.sh` on `ora01`): generate a compliant random password → set it in AD → `mkstore -modifyEntry` the wallet → validate with the DBMS_LDAP smoke test or `ad_sync.ad_sync.run` → **on failure roll the AD password back** to the old value → append to a rotation audit log → schedule via cron/Task Scheduler. Whether you *should* depends on these four realities:
+
+1. **`mkstore` is interactive.** It will not take the wallet password as a CLI argument (by design); the automation must pipe it via stdin — so the job must *hold the wallet password* (secret-zero, see #4).
+2. **Two-system non-atomicity.** There is always a brief window where AD has the new password but the wallet still has the old (or vice-versa) → `ad_sync` binds fail (rc=49) during it. **This is low-stakes here precisely because the sync fails *open* with a circuit breaker** (see [docs/20 §2](20-architecture-and-hardening.md)): authenticated users keep their last-good roles; only *authorization changes* lag a few seconds. You need "near-atomic," not atomic. Run it off-peak. (gMSA would give true auto-rotation but Oracle-on-Linux cannot consume a gMSA secret — it's a Windows-LSA feature — so it's not an option for this account.)
+3. **`-CannotChangePassword $true`.** We deliberately set that on `svc-ora-ldap` (§A3). It blocks the elegant "account self-rotates over the existing LDAPS channel" approach. Either relax that flag (accept self-rotation) or drive the AD reset with a separate admin credential — decide explicitly.
+4. **Secret-zero / privilege trade-off — the honest question.** An always-on rotation job must hold the wallet password *and* either an AD admin credential or self-rotation rights. You would be introducing a **higher-privilege standing automation credential to avoid manually rotating a single low-privilege read-only bind account**. For one such account, a quarterly runbook step a human runs is often the lower-risk choice. Automation wins clearly only with frequent (e.g. 30-day) policy rotation or many such accounts.
+
+Recommendation: **frequent policy-forced rotation → automate** (build the script with rollback + `--dry-run`); **quarterly/annual → keep this manual runbook step** — it's the lower-risk path and adds no powerful standing credential. The script is intentionally *not* shipped in the repo until that decision is made, so no one stands up the automation (and its credentials) by accident.
 
 ### B4. Decommission a user
 
