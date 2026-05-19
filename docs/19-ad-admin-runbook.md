@@ -100,6 +100,14 @@ ktpass `
 
 In one sentence: *"derive an AES256-only keytab for this SPN, named as a standard Kerberos principal so a Linux/Java service can consume it."*
 
+#### References & tool provenance (important nuance)
+
+`ktpass` is a **Microsoft** tool, not an Oracle one — there is no "Oracle docs for ktpass" because Oracle's own Kerberos chapter doesn't use it:
+
+- **`ktpass` flag spec (authoritative):** Microsoft Learn — *ktpass* command reference: <https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/ktpass>. This is the source of truth for `-crypto`, `-ptype`, `-mapuser`, `-pass`. It explicitly states *"Because the default settings are based on older MIT versions, you should always use the `/crypto` parameter"* (corroborating why we pin `AES256-SHA1`) and lists `KRB5_NT_PRINCIPAL` as the recommended type. Note `ktpass` accepts both `/flag` and `-flag` forms; this runbook uses `-flag`.
+- **Why we use `ktpass` at all:** because the KDC here is **Active Directory**. Oracle's AD-specific guidance is the 19c *Database Security Guide* → *Configuring Centrally Managed Users with Microsoft Active Directory*: <https://docs.oracle.com/en/database/oracle/oracle-database/19/dbseg/integrating_mads_with_oracle_database.html>
+- **Oracle's generic Kerberos chapter** (19c *Database Security Guide* ch. 22, *Configuring Kerberos Authentication*: <https://docs.oracle.com/en/database/oracle/oracle-database/19/dbseg/configuring-kerberos-authentication.html>) deliberately uses **`ktadd`** (MIT `kadmin`) or Oracle's **`okcreate`** — *not* `ktpass`. Those apply when the KDC is MIT/Heimdal, not AD. If anyone asks "the Oracle docs say `okcreate`, why does this runbook say `ktpass`?": because our KDC is AD, and on AD the keytab is produced on the DC with the Windows tool.
+
 #### Verify the keytab really is AES256 (don't trust, check)
 
 `ktpass` historically had AES interop / salt / case quirks, and `Set-ADUser -KerberosEncryptionType AES256` does **not** by itself guarantee RC4 is refused at runtime unless domain policy agrees. Verify both ends:
