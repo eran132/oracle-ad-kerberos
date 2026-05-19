@@ -147,6 +147,38 @@ Oracle stores externally-identified users *as quoted strings* and the realm part
 
 ---
 
+## Kerberos, SPN & AD service accounts
+
+### Why two service accounts (`svc-ora01` and `svc-ora-ldap`)? Why not combine them?
+
+`svc-ora01` is the Kerberos *service identity* (holds the SPN; its key is the keytab — authenticates the user). `svc-ora-ldap` is the *directory reader* (Oracle binds to AD as it to read `memberOf` — authorizes the user). They must stay separate primarily because `svc-ora01`'s password changes on *every* `ktpass` run while `svc-ora-ldap`'s must stay stable (the wallet holds a copy); merging them makes routine keytab rotation silently break authorization. Plus least-privilege/blast-radius. Full reasoning: [docs/20 §1](20-architecture-and-hardening.md), [docs/19 §A3](19-ad-admin-runbook.md).
+
+### Does `ktpass -mapuser` point at a user account or the host/computer account?
+
+A dedicated **user** service account (`svc-ora01`) — for an Oracle-keytab-on-Linux scenario, unambiguously. Computer-account passwords auto-rotate (~30 days) and would silently invalidate a static keytab. (`-mapuser` *can* target a machine account for native Windows services generally, but not for this case.) [docs/19 §A2](19-ad-admin-runbook.md).
+
+### Why `-crypto AES256-SHA1` and not `-crypto All`?
+
+`All` writes weak DES/RC4 keys into the keytab too — weak key material at rest, a re-opened RC4 downgrade path, and inconsistent account state. AES256-only is strong-or-fail. [docs/19 §A2 "Why not `-crypto All`?"](19-ad-admin-runbook.md).
+
+### Why `-ptype KRB5_NT_PRINCIPAL`?
+
+It means "use the principal name *literally*, no canonicalization" — required because Oracle/MIT/Java match the SPN byte-for-byte. The host-based types (`KRB5_NT_SRV_HST`) let the KDC rewrite the hostname, breaking the match. [docs/03 ktpass note](03-ad-and-spn-setup.md) · [docs/19 §A2](19-ad-admin-runbook.md).
+
+### Why is the realm `MYLAB.LOCAL` upper-case but the host `ora01.mylab.local` lower-case?
+
+Two different namespaces: the host is DNS (case-insensitive, lowercase convention); the realm is a Kerberos identifier (case-*sensitive*, and AD's realm literally *is* the uppercased DNS domain). Lowercasing the realm in `krb5.ini` → "Cannot find KDC for realm". [docs/03 "Naming & case conventions"](03-ad-and-spn-setup.md).
+
+### Do we need Kerberos delegation?
+
+No. There is no second hop performed *as the end user* (Oracle→AD binds as `svc-ora-ldap`'s own credential, not a forwarded user ticket). Never set "Trust this account for delegation" on the service accounts; `forwardable = false` in `krb5.ini` additionally makes delegation impossible. Avoiding it is a security strength. [docs/20 §7](20-architecture-and-hardening.md), [docs/19 §A1](19-ad-admin-runbook.md).
+
+### Can I automate the `svc-ora-ldap` wallet-password rotation?
+
+Yes, but weigh four gotchas (interactive `mkstore`, two-system non-atomicity — mitigated by the fail-open circuit breaker, `CannotChangePassword`, and a secret-zero/privilege trade-off). For a single low-privilege account, a quarterly manual runbook step is often the lower-risk choice; automate only for frequent policy rotation. Design + decision criteria: [docs/19 Part B3](19-ad-admin-runbook.md).
+
+---
+
 ## Air-gapped / offline
 
 ### What gets downloaded during install? Can I see the inventory?
